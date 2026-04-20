@@ -1,4 +1,4 @@
--- IINA-style floating pill OSC for mpv
+-- IINA-style bottom bar OSC for mpv
 -- A from-scratch implementation inspired by IINA's macOS media player interface
 --
 -- Install:
@@ -36,14 +36,16 @@ local user_opts = {
     fadein              = true,
     minmousemove        = 0,
 
-    -- Pill Geometry
-    pill_max_width      = 720,
-    pill_width_ratio    = 0.88,
-    pill_height         = 64,
-    pill_bottom_margin  = 32,
+    -- Bar Geometry
+    bar_height          = 70,
+    bar_padding_h       = 15,
+    bar_padding_v       = 8,
+    pill_corner_radius  = 14,
+    pill_bottom_margin  = 18,
+    pill_width_ratio    = 0.70,
 
     -- Seekbar
-    seekbar_fg_color    = "#FFFFFF",
+    seekbar_fg_color    = "#00E762",
     seekbar_bg_color    = "#48484A",
     seekbar_cache_color = "#636366",
     seekbar_handle_size = 0.85,
@@ -52,7 +54,7 @@ local user_opts = {
 
     -- Appearance
     background_color    = "#1C1C1E",
-    background_alpha    = 40,               -- 0=opaque, 255=invisible
+    background_alpha    = 30,               -- 0=opaque, 255=invisible
     panel_blur          = 2,                -- 0-40
     icons_color         = "#FFFFFF",
     text_color          = "#F2F2F7",
@@ -71,6 +73,8 @@ local user_opts = {
     volume_control      = true,
     audio_button        = true,
     subtitle_button     = true,
+    playlist_button     = true,
+    speed_button        = true,
     fullscreen_button   = true,
 
     -- Seekbar range style
@@ -89,7 +93,7 @@ local user_opts = {
     title = "${!playlist-count==1:[${playlist-pos-1}/${playlist-count}] }${media-title}",
 
     -- Window controls
-    windowcontrols      = "auto",
+    windowcontrols      = "no",
     windowcontrols_alignment = "right",
 
     -- Command bindings  (left / mid / right mouse button)
@@ -153,10 +157,11 @@ local icons = {
     volume_quiet    = "material_volume_mute",
     volume_low      = "material_volume_down",
     volume_high     = "material_volume_up",
-    audio           = "material_surround_sound",
+    audio           = "fluent_volume_up",
     subtitle        = "material_subtitles",
     fullscreen      = "material_fullscreen",
     fullscreen_exit = "material_fullscreen_exit",
+    playlist        = "material_playlist_play",
     close           = "window_close",
     minimize        = "window_minimize",
     maximize        = "window_maximize",
@@ -181,10 +186,8 @@ local function set_osc_styles()
     local blur = tostring(math.min(40, math.max(0, user_opts.panel_blur)))
 
     osc_styles = {
-        pill_bg = "{\\rDefault\\blur" .. blur .. "\\bord1\\shad3"
-            .. "\\1c&H" .. bg .. "&\\3c&H505050&\\4c&H000000&}",
-        pill_shadow = "{\\rDefault\\blur14\\bord0"
-            .. "\\1c&H000000&\\3c&H000000&}",
+        bar_bg = "{\\rDefault\\blur" .. blur .. "\\bord0\\shad0"
+            .. "\\1c&H" .. bg .. "&}",
 
         icons = "{\\blur0\\bord0\\1c&H" .. ic .. "&\\3c&HFFFFFF&\\fn" .. icon_font .. "}",
         icons_large = "{\\blur0\\bord0\\1c&H" .. ic .. "&\\3c&HFFFFFF&\\fs36\\fn" .. icon_font .. "}",
@@ -203,7 +206,14 @@ local function set_osc_styles()
         seekbar_marker = "{\\blur0\\bord0\\1c&H" .. osc_color_convert(user_opts.chapter_marker_color) .. "&}",
 
         wcButtons = "{\\1c&H" .. ic .. "&\\fs20\\fn" .. icon_font .. "}",
+
+        speed_text = "{\\blur0\\bord0\\1c&H" .. ic .. "&\\3c&HFFFFFF&\\fs16}",
         wcBar     = "{\\1c&H" .. bg .. "&}",
+
+        dropdown_bg = "{\\rDefault\\blur1\\bord0\\shad0\\1c&H" .. bg .. "&}",
+        dropdown_item = "{\\blur0\\bord1\\shad0\\1c&HFFFFFF&\\3c&H000000&\\fs18\\q2}",
+        dropdown_item_active = "{\\blur0\\bord1\\shad0\\1c&H"
+            .. osc_color_convert(user_opts.seekbar_fg_color) .. "&\\3c&H000000&\\fs18\\q2}",
     }
 end
 
@@ -249,6 +259,16 @@ local state = {
     slider_element    = nil,
     visibility_modes  = {},
     using_video_margins = false,
+    -- Pill drag
+    pill_y_offset       = 0,
+    pill_dragging       = false,
+    pill_drag_start_y   = nil,
+    pill_drag_start_offset = nil,
+    -- Track dropdown
+    dropdown            = nil,       -- nil / "audio" / "sub" / "playlist" / "speed"
+    dropdown_items      = {},        -- {{id, x1, y1, x2, y2}, ...}
+    dropdown_scroll     = 0,         -- scroll offset (number of items scrolled)
+    dropdown_hitbox     = nil,       -- {x1, y1, x2, y2} bounding box of dropdown
 }
 
 local osc_param = {
@@ -451,6 +471,37 @@ local function update_margins()
 end
 
 ---------------------------------------------------------------------------
+-- Pill Offset Persistence
+---------------------------------------------------------------------------
+local function get_state_file_path()
+    local dir = mp.command_native({"expand-path", "~~home/script-data"})
+    return utils.join_path(dir, "iina-osc-state")
+end
+
+local function save_pill_offset()
+    local dir = mp.command_native({"expand-path", "~~home/script-data"})
+    utils.subprocess({args = {"mkdir", "-p", dir}})
+    local path = get_state_file_path()
+    local f = io.open(path, "w")
+    if f then
+        f:write(string.format("pill_y_offset=%d\n", state.pill_y_offset or 0))
+        f:close()
+    end
+end
+
+local function load_pill_offset()
+    local path = get_state_file_path()
+    local f = io.open(path, "r")
+    if f then
+        for line in f:lines() do
+            local val = line:match("^pill_y_offset=(-?%d+)")
+            if val then state.pill_y_offset = tonumber(val) end
+        end
+        f:close()
+    end
+end
+
+---------------------------------------------------------------------------
 -- Tick Request (forward declaration)
 ---------------------------------------------------------------------------
 local tick
@@ -513,6 +564,7 @@ end
 
 local function new_element(name, type)
     elements[name] = {}
+    elements[name].name = name
     elements[name].type = type
     elements[name].eventresponder = {}
     elements[name].visible = true
@@ -717,6 +769,8 @@ local function render_elements(master_ass)
                 ass_append_alpha(elem_ass, element.layout.alpha, 0)
                 elem_ass:append(osc_styles.seekbar_bg)
                 elem_ass:draw_start()
+                elem_ass:move_to(0, 0)
+                elem_ass:move_to(elem_geo.w, elem_geo.h)
                 elem_ass:round_rect_cw(seek_left, cx - track_h / 2,
                     seek_right, cx + track_h / 2, track_h / 2)
                 elem_ass:draw_stop()
@@ -732,6 +786,8 @@ local function render_elements(master_ass)
                             user_opts.seekrangealpha)
                         elem_ass:append(osc_styles.seekbar_cache)
                         elem_ass:draw_start()
+                        elem_ass:move_to(0, 0)
+                        elem_ass:move_to(elem_geo.w, elem_geo.h)
                         for _, range in pairs(seekRanges) do
                             local ps = get_slider_ele_pos_for(element, range["start"])
                             local pe = get_slider_ele_pos_for(element, range["end"])
@@ -750,6 +806,8 @@ local function render_elements(master_ass)
                     ass_append_alpha(elem_ass, element.layout.alpha, 0)
                     elem_ass:append(osc_styles.seekbar_fg)
                     elem_ass:draw_start()
+                    elem_ass:move_to(0, 0)
+                    elem_ass:move_to(elem_geo.w, elem_geo.h)
                     elem_ass:round_rect_cw(seek_left, cx - track_h / 2,
                         xp, cx + track_h / 2, track_h / 2)
                     elem_ass:draw_stop()
@@ -765,6 +823,8 @@ local function render_elements(master_ass)
                         ass_append_alpha(elem_ass, element.layout.alpha, 0)
                         elem_ass:append(osc_styles.seekbar_marker)
                         elem_ass:draw_start()
+                        elem_ass:move_to(0, 0)
+                        elem_ass:move_to(elem_geo.w, elem_geo.h)
                         for _, marker in pairs(markers) do
                             if marker > element.slider.min.value and
                                marker < element.slider.max.value then
@@ -787,8 +847,10 @@ local function render_elements(master_ass)
                     elem_ass:pos(elem_geo.x, elem_geo.y)
                     elem_ass:an(elem_geo.an)
                     ass_append_alpha(elem_ass, element.layout.alpha, 0)
-                    elem_ass:append(osc_styles.seekbar_fg)
+                    elem_ass:append("{\\blur0\\bord0\\1c&HFFFFFF&}")
                     elem_ass:draw_start()
+                    elem_ass:move_to(0, 0)
+                    elem_ass:move_to(elem_geo.w, elem_geo.h)
                     elem_ass:round_rect_cw(xp - kr, cx - kr, xp + kr, cx + kr, kr)
                     elem_ass:draw_stop()
                 end
@@ -852,15 +914,41 @@ local function render_elements(master_ass)
                     local xp = get_slider_ele_pos_for(element, pos)
                     local r = (0.5 * innerH) / 2  -- small knob for volume
 
-                    -- fill bar
+                    -- remaining track (gray)
+                    elem_ass:new_event()
+                    elem_ass:pos(elem_geo.x, elem_geo.y)
+                    elem_ass:an(elem_geo.an)
+                    ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                    elem_ass:append(osc_styles.seekbar_bg)
                     elem_ass:draw_start()
+                    elem_ass:move_to(0, 0)
+                    elem_ass:move_to(elem_geo.w, elem_geo.h)
+                    elem_ass:round_rect_cw(foH - innerH / 6, foH - innerH / 6,
+                        elem_geo.w - foH + innerH / 6, foH + innerH / 6, innerH / 6)
+                    elem_ass:draw_stop()
+
+                    -- fill bar (green)
+                    elem_ass:new_event()
+                    elem_ass:pos(elem_geo.x, elem_geo.y)
+                    elem_ass:an(elem_geo.an)
+                    ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                    elem_ass:append(osc_styles.seekbar_fg)
+                    elem_ass:draw_start()
+                    elem_ass:move_to(0, 0)
+                    elem_ass:move_to(elem_geo.w, elem_geo.h)
                     elem_ass:round_rect_cw(foH - innerH / 6, foH - innerH / 6,
                         xp, foH + innerH / 6, innerH / 6)
-                    -- remaining track
-                    elem_ass:round_rect_cw(xp, foH - innerH / 15,
-                        elem_geo.w - foH + innerH / 15, foH + innerH / 15,
-                        innerH / 15)
-                    -- knob
+                    elem_ass:draw_stop()
+
+                    -- knob (white)
+                    elem_ass:new_event()
+                    elem_ass:pos(elem_geo.x, elem_geo.y)
+                    elem_ass:an(elem_geo.an)
+                    ass_append_alpha(elem_ass, element.layout.alpha, 0)
+                    elem_ass:append("{\\blur0\\bord0\\1c&HFFFFFF&}")
+                    elem_ass:draw_start()
+                    elem_ass:move_to(0, 0)
+                    elem_ass:move_to(elem_geo.w, elem_geo.h)
                     elem_ass:round_rect_cw(xp - r, foH - r, xp + r, foH + r, r)
                     elem_ass:draw_stop()
                 end
@@ -907,74 +995,383 @@ local function render_elements(master_ass)
     end
 end
 
----------------------------------------------------------------------------
--- Floating Pill Layout
----------------------------------------------------------------------------
+-- UTF-8 aware string truncation (max_chars = max Unicode codepoints)
+-- Width-aware UTF-8 truncation: CJK chars count as 2 width units, others as 1
+local function utf8_trunc(s, max_width)
+    local width = 0
+    local i = 1
+    local len = #s
+    while i <= len do
+        local b = s:byte(i)
+        local char_len, codepoint
+        if b < 0x80 then
+            char_len = 1
+            codepoint = b
+        elseif b < 0xE0 then
+            char_len = 2
+            codepoint = (b - 0xC0) * 64 + (s:byte(i + 1) - 0x80)
+        elseif b < 0xF0 then
+            char_len = 3
+            codepoint = (b - 0xE0) * 4096 + (s:byte(i + 1) - 0x80) * 64
+                      + (s:byte(i + 2) - 0x80)
+        else
+            char_len = 4
+            codepoint = (b - 0xF0) * 262144 + (s:byte(i + 1) - 0x80) * 4096
+                      + (s:byte(i + 2) - 0x80) * 64 + (s:byte(i + 3) - 0x80)
+        end
+        local cw = (codepoint >= 0x2E80) and 2 or 1
+        if width + cw > max_width then
+            return s:sub(1, i - 1) .. "..."
+        end
+        width = width + cw
+        i = i + char_len
+    end
+    return s
+end
 
-local function layout_floating_pill()
-    local pill_h = user_opts.pill_height
-    local pill_w = math.min(
-        osc_param.playresx * user_opts.pill_width_ratio,
-        user_opts.pill_max_width)
-    local pill_r = pill_h / 2
-    local pill_margin = user_opts.pill_bottom_margin
-
-    -- Ensure pill fits on screen
-    if pill_w < 200 then
-        pill_w = math.min(osc_param.playresx - 20, 200)
+local function render_dropdown(master_ass)
+    if state.dropdown == nil then
+        state.dropdown_hitbox = nil
+        return
     end
 
-    -- Pill center coordinates
-    local pill_cx = osc_param.playresx / 2
-    local pill_cy = osc_param.playresy - pill_margin - pill_h / 2
+    -- Find anchor button element
+    local anchor_name
+    if state.dropdown == "audio" then
+        anchor_name = "audio_track"
+    elseif state.dropdown == "sub" then
+        anchor_name = "sub_track"
+    elseif state.dropdown == "playlist" then
+        anchor_name = "playlist_list"
+    elseif state.dropdown == "speed" then
+        anchor_name = "speed"
+    else
+        state.dropdown = nil
+        state.dropdown_hitbox = nil
+        return
+    end
 
-    -- Pill edges
-    local pill_left  = pill_cx - pill_w / 2
-    local pill_right = pill_cx + pill_w / 2
-    local pill_top   = pill_cy - pill_h / 2
-    local pill_bot   = pill_cy + pill_h / 2
+    local anchor = nil
+    for _, element in ipairs(elements) do
+        if element.name == anchor_name then
+            anchor = element
+            break
+        end
+    end
+    if not anchor or not anchor.hitbox then
+        state.dropdown = nil
+        state.dropdown_hitbox = nil
+        return
+    end
 
-    local pad = 15  -- internal padding
+    -- Build items depending on dropdown type
+    local items = {}
+
+    if state.dropdown == "playlist" then
+        local playlist = mp.get_property_native("playlist", {})
+        local current_pos = mp.get_property_number("playlist-pos", 0)
+        for i, entry in ipairs(playlist) do
+            local label = ""
+            if entry.title and entry.title ~= "" then
+                label = entry.title
+            elseif entry.filename then
+                label = entry.filename:match("([^/\\]+)$") or entry.filename
+            end
+            if label == "" then
+                label = "Item " .. i
+            end
+            label = utf8_trunc(label, 36)
+            table.insert(items, {
+                id = i - 1,
+                label = label,
+                selected = ((i - 1) == current_pos),
+            })
+        end
+    elseif state.dropdown == "speed" then
+        local speed_presets = {2.0, 1.75, 1.5, 1.25, 1.0, 0.75, 0.5, 0.25}
+        local current_speed = mp.get_property_number("speed", 1)
+        for i, sp in ipairs(speed_presets) do
+            local label
+            if sp == math.floor(sp) then
+                label = string.format("%d.0x", sp)
+            else
+                label = string.format("%gx", sp)
+            end
+            local is_selected = (math.abs(current_speed - sp) < 0.01)
+            table.insert(items, {
+                id = i,
+                label = label,
+                selected = is_selected,
+                speed_val = sp,
+            })
+        end
+    else
+        -- Audio / subtitle track dropdown
+        local track_type = state.dropdown == "audio" and "audio" or "sub"
+        local prop = state.dropdown == "audio" and "aid" or "sid"
+        local tracks = mp.get_property_native("track-list", {})
+        local current_id = mp.get_property_number(prop, 0)
+
+        table.insert(items, {id = 0, label = "Disabled", selected = (current_id == 0)})
+        for _, track in ipairs(tracks) do
+            if track.type == track_type then
+                local label = ""
+                if track.title and track.title ~= "" then
+                    label = track.title
+                elseif track.lang and track.lang ~= "" then
+                    label = track.lang
+                end
+                if label == "" then
+                    label = "Track " .. track.id
+                else
+                    label = "Track " .. track.id .. ": " .. label
+                end
+                label = utf8_trunc(label, 36)
+                table.insert(items, {
+                    id = track.id,
+                    label = label,
+                    selected = track.selected,
+                })
+            end
+        end
+    end
+
+    if #items == 0 then
+        state.dropdown = nil
+        state.dropdown_hitbox = nil
+        return
+    end
+
+    -- Dropdown geometry
+    local item_h = 30
+    local pad = 10
+    local dropdown_w = (state.dropdown == "speed") and 130 or 370
+
+    -- Calculate max available height (don't exceed video window)
+    local input_area = osc_param.areas["input"] and osc_param.areas["input"][1]
+    local pill_top = input_area and input_area.y1 or anchor.hitbox.y1
+    local dropdown_bottom = pill_top - 6
+    local max_dropdown_h = dropdown_bottom - 10  -- leave 10px margin at top
+
+    -- Full content height vs max height
+    local full_h = (#items * item_h) + (2 * pad)
+    local dropdown_h = math.min(full_h, max_dropdown_h)
+
+    -- How many items can be visible at once
+    local visible_area_h = dropdown_h - (2 * pad)
+    local max_visible = math.floor(visible_area_h / item_h)
+    if max_visible < 1 then max_visible = 1 end
+    local needs_scroll = #items > max_visible
+
+    -- Clamp scroll offset
+    local max_scroll = math.max(0, #items - max_visible)
+    state.dropdown_scroll = math.max(0, math.min(state.dropdown_scroll, max_scroll))
+    local scroll_offset = state.dropdown_scroll
+
+    -- Recalculate dropdown_h based on actual visible items
+    local visible_count = math.min(#items, max_visible)
+    dropdown_h = (visible_count * item_h) + (2 * pad)
+
+    local anchor_cx = (anchor.hitbox.x1 + anchor.hitbox.x2) / 2
+    local dropdown_x = anchor_cx - dropdown_w / 2
+    local dropdown_top = dropdown_bottom - dropdown_h
+
+    -- Clamp to screen horizontally
+    if dropdown_x < 5 then dropdown_x = 5 end
+    if dropdown_x + dropdown_w > osc_param.playresx - 5 then
+        dropdown_x = osc_param.playresx - 5 - dropdown_w
+    end
+    if dropdown_top < 5 then dropdown_top = 5 end
+
+    -- Store dropdown hitbox for mouse-over detection
+    state.dropdown_hitbox = {
+        x1 = dropdown_x,
+        y1 = dropdown_top,
+        x2 = dropdown_x + dropdown_w,
+        y2 = dropdown_top + dropdown_h,
+    }
+
+    -- Apply OSC alpha
+    local alpha = state.animation or 0
+
+    -- Get mouse position for hover detection
+    local mx, my = get_virt_mouse_pos()
+
+    -- Render background
+    master_ass:new_event()
+    master_ass:pos(dropdown_x, dropdown_top)
+    master_ass:an(7)
+    master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+    master_ass:append(osc_styles.dropdown_bg)
+    master_ass:draw_start()
+    master_ass:move_to(0, 0)
+    master_ass:move_to(dropdown_w, dropdown_h)
+    master_ass:round_rect_cw(0, 0, dropdown_w, dropdown_h, 10)
+    master_ass:draw_stop()
+
+    -- Render visible items and store hitboxes
+    state.dropdown_items = {}
+    for vi = 1, visible_count do
+        local i = vi + scroll_offset
+        local item = items[i]
+        if not item then break end
+
+        local item_y = dropdown_top + pad + (vi - 1) * item_h
+        local item_cy = item_y + item_h / 2
+        local ix1 = dropdown_x + 4
+        local ix2 = dropdown_x + dropdown_w - 4
+        local is_hovered = (mx >= ix1 and mx <= ix2 and my >= item_y and my <= item_y + item_h)
+
+        -- Hover highlight background
+        if is_hovered then
+            master_ass:new_event()
+            master_ass:pos(dropdown_x + 4, item_y)
+            master_ass:an(7)
+            master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+            master_ass:append("{\\bord0\\shad0\\1c&HFFFFFF&\\1a&HD0&}")
+            master_ass:draw_start()
+            master_ass:move_to(0, 0)
+            master_ass:move_to(dropdown_w - 8, item_h)
+            master_ass:round_rect_cw(0, 0, dropdown_w - 8, item_h, 6)
+            master_ass:draw_stop()
+        end
+
+        -- Selected item background tint
+        if item.selected and not is_hovered then
+            master_ass:new_event()
+            master_ass:pos(dropdown_x + 4, item_y)
+            master_ass:an(7)
+            master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+            master_ass:append("{\\bord0\\shad0\\1c&H"
+                .. osc_color_convert(user_opts.seekbar_fg_color) .. "&\\1a&HE0&}")
+            master_ass:draw_start()
+            master_ass:move_to(0, 0)
+            master_ass:move_to(dropdown_w - 8, item_h)
+            master_ass:round_rect_cw(0, 0, dropdown_w - 8, item_h, 6)
+            master_ass:draw_stop()
+        end
+
+        -- Item text (with checkmark for selected)
+        local display_label = item.label
+        if item.selected then
+            display_label = "\xe2\x9c\x93  " .. display_label
+        end
+
+        master_ass:new_event()
+        master_ass:pos(dropdown_x + pad + 6, item_cy)
+        master_ass:an(4)
+        master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+        if item.selected then
+            master_ass:append(osc_styles.dropdown_item_active)
+        else
+            master_ass:append(osc_styles.dropdown_item)
+        end
+        master_ass:append(mp.command_native({"escape-ass", display_label}))
+
+        -- Store hitbox for click detection
+        state.dropdown_items[vi] = {
+            id = item.id,
+            speed_val = item.speed_val,
+            x1 = dropdown_x,
+            y1 = item_y,
+            x2 = dropdown_x + dropdown_w,
+            y2 = item_y + item_h,
+        }
+    end
+
+    -- Scroll indicators
+    if needs_scroll then
+        -- Up arrow indicator
+        if scroll_offset > 0 then
+            master_ass:new_event()
+            master_ass:pos(dropdown_x + dropdown_w / 2, dropdown_top + 4)
+            master_ass:an(8)
+            master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+            master_ass:append("{\\blur0\\bord0\\shad0\\1c&HFFFFFF&\\fs10}")
+            master_ass:append("\xe2\x96\xb2")
+        end
+        -- Down arrow indicator
+        if scroll_offset < max_scroll then
+            master_ass:new_event()
+            master_ass:pos(dropdown_x + dropdown_w / 2, dropdown_top + dropdown_h - 4)
+            master_ass:an(2)
+            master_ass:append(string.format("{\\alpha&H%02X&}", alpha))
+            master_ass:append("{\\blur0\\bord0\\shad0\\1c&HFFFFFF&\\fs10}")
+            master_ass:append("\xe2\x96\xbc")
+        end
+    end
+end
+
+---------------------------------------------------------------------------
+-- Bottom Bar Layout
+---------------------------------------------------------------------------
+
+local function layout_bottom_bar()
+    local bar_h = user_opts.bar_height
+    local pad_h = user_opts.bar_padding_h
+    local pad_v = user_opts.bar_padding_v
+
+    -- Pill width: ratio of window, clamped to reasonable bounds
+    local raw_w = osc_param.playresx * user_opts.pill_width_ratio
+    local pill_w = math.max(480, math.min(1100, raw_w))
+    pill_w = math.min(pill_w, osc_param.playresx - 20)
+
+    -- Centered horizontally, floating above bottom edge
+    local bar_left  = (osc_param.playresx - pill_w) / 2
+    local bar_right = bar_left + pill_w
+    local bar_bot   = osc_param.playresy - user_opts.pill_bottom_margin - (state.pill_y_offset or 0)
+    local bar_top   = bar_bot - bar_h
+
+    local bar_cx = osc_param.playresx / 2
+    local bar_cy = bar_top + bar_h / 2
 
     osc_param.areas = {}
 
-    -- Input area = pill bounding box
-    add_area("input", pill_left, pill_top, pill_right, pill_bot)
+    -- Input area = pill bounds
+    add_area("input", bar_left, bar_top, bar_right, bar_bot)
 
-    -- Show/hide area = bottom portion of screen
-    local sh_area_y0 = pill_top - (pill_h * 2)  -- deadzone above pill
+    -- Show/hide area = full-width bottom portion of screen
+    local sh_area_y0 = bar_top - (bar_h * 1.0)
     add_area("showhide", 0, sh_area_y0, osc_param.playresx, osc_param.playresy)
 
     local lo
 
-    -- === Pill Shadow (soft glow behind pill for depth) ===
-    new_element("pill_shadow", "box")
-    lo = add_layout("pill_shadow")
-    lo.geometry = {x = pill_cx, y = pill_cy + 2, an = 5, w = pill_w + 8, h = pill_h + 8}
-    lo.layer = 9
-    lo.style = osc_styles.pill_shadow
-    lo.alpha[1] = 160
-    lo.alpha[3] = 255
-    lo.box.radius = pill_r + 4
-
-    -- === Pill Background ===
-    new_element("pill_bg", "box")
-    lo = add_layout("pill_bg")
-    lo.geometry = {x = pill_cx, y = pill_cy, an = 5, w = pill_w, h = pill_h}
+    -- === Bar Background (floating pill with rounded corners) ===
+    new_element("bar_bg", "box")
+    lo = add_layout("bar_bg")
+    lo.geometry = {x = bar_cx, y = bar_cy, an = 5, w = pill_w, h = bar_h}
     lo.layer = 10
-    lo.style = osc_styles.pill_bg
+    lo.style = osc_styles.bar_bg
     lo.alpha[1] = user_opts.background_alpha
-    lo.alpha[3] = math.min(255, user_opts.background_alpha + 80)
-    lo.alpha[4] = math.min(255, user_opts.background_alpha + 100)
-    lo.box.radius = pill_r
+    lo.alpha[3] = 255
+    lo.alpha[4] = 255
+    lo.box.radius = user_opts.pill_corner_radius
 
-    -- === Row 1: Seekbar (top 22px of pill) ===
-    local seekbar_y = pill_top + 12  -- center of seekbar row
-    local seekbar_w = pill_w - (2 * pad) - 10
-    local seekbar_h = 20  -- hit area height
+    -- === Row 1: Seekbar with flanking time codes ===
+    local seekbar_row_cy = bar_top + pad_v + 12
+    local tc_w = 62
+    local tc_gap = 8
+    local seekbar_h = 20
+
+    -- Time left (current position)
+    local tc_left_x = bar_left + pad_h
+    lo = add_layout("tc_left")
+    lo.geometry = {x = tc_left_x, y = seekbar_row_cy, an = 4, w = tc_w, h = 24}
+    lo.style = osc_styles.timecodes
+
+    -- Time right (remaining/total)
+    lo = add_layout("tc_right")
+    lo.geometry = {x = bar_right - pad_h, y = seekbar_row_cy, an = 6, w = tc_w, h = 24}
+    lo.style = osc_styles.timecodes
+
+    -- Seekbar (between time codes)
+    local seekbar_x0 = tc_left_x + tc_w + tc_gap
+    local seekbar_x1 = bar_right - pad_h - tc_w - tc_gap
+    local seekbar_w = seekbar_x1 - seekbar_x0
+    local seekbar_cx = (seekbar_x0 + seekbar_x1) / 2
 
     lo = add_layout("seekbar")
-    lo.geometry = {x = pill_cx, y = seekbar_y, an = 5, w = seekbar_w, h = seekbar_h}
+    lo.geometry = {x = seekbar_cx, y = seekbar_row_cy, an = 5, w = seekbar_w, h = seekbar_h}
     lo.style = osc_styles.seekbar_fg
     lo.slider.border = 0
     lo.slider.gap = 2
@@ -982,125 +1379,123 @@ local function layout_floating_pill()
     lo.slider.tooltip_an = 2
     lo.slider.stype = "knob"
 
-    -- === Row 2: Controls (bottom 42px of pill) ===
-    local ctrl_y = pill_bot - 22  -- center of controls row
+    -- === Row 2: Controls (3-group layout) ===
+    local ctrl_y = bar_bot - pad_v - 15
     local btn_w = 30
     local btn_h = 30
-    local btn_pad = 5  -- spacing between buttons
-    local playresx = osc_param.playresx
+    local btn_gap = 5
+    local play_w = 38
+    local play_h = 38
 
-    -- Responsive: determine which controls to show
-    local show_chapter = user_opts.chapter_buttons and pill_w > 450
-    local show_volume  = user_opts.volume_control and pill_w > 350
-    local show_audio   = user_opts.audio_button and pill_w > 550
-    local show_sub     = user_opts.subtitle_button and pill_w > 550
-    local show_fs      = user_opts.fullscreen_button and pill_w > 400
-    local show_vol_slider = show_volume and pill_w > 500
+    -- Responsive visibility (keyed off pill_w)
+    local show_chapter    = user_opts.chapter_buttons and pill_w > 450
+    local show_volume     = user_opts.volume_control and pill_w > 300
+    local show_vol_slider = show_volume and pill_w > 480
+    local show_audio      = user_opts.audio_button and pill_w > 500
+    local show_sub        = user_opts.subtitle_button and pill_w > 500
+    local show_playlist   = user_opts.playlist_button and pill_w > 500
+        and mp.get_property_number("playlist-count", 0) > 1
+    local show_speed      = user_opts.speed_button and pill_w > 400
+    local show_fs         = user_opts.fullscreen_button and pill_w > 350
 
-    -- Left side: time_left, [chapter_prev], playlist_prev, play_pause, playlist_next, [chapter_next]
-    local lx = pill_left + pad  -- current x (left edge of next element)
+    -- === LEFT GROUP: volume icon + volume slider ===
+    local lx = bar_left + pad_h
 
-    -- Time left
-    local tc_w = 70
-    lo = add_layout("tc_left")
-    lo.geometry = {x = lx, y = ctrl_y, an = 4, w = tc_w, h = btn_h}
-    lo.style = osc_styles.timecodes
-    lx = lx + tc_w + btn_pad
-
-    -- Chapter prev
-    if show_chapter then
-        lo = add_layout("chapter_prev")
+    if show_volume then
+        lo = add_layout("volume")
         lo.geometry = {x = lx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
         lo.style = osc_styles.icons_small
-        lx = lx + btn_w + btn_pad
+        lx = lx + btn_w + 4
     end
 
-    -- Playlist prev
-    lo = add_layout("playlist_prev")
-    lo.geometry = {x = lx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-    lo.style = osc_styles.icons_small
-    lx = lx + btn_w + btn_pad
-
-    -- Play/Pause (larger)
-    lo = add_layout("play_pause")
-    lo.geometry = {x = lx, y = ctrl_y, an = 4, w = btn_w + 8, h = btn_h + 8}
-    lo.style = osc_styles.icons_large
-    lx = lx + btn_w + 8 + btn_pad
-
-    -- Playlist next
-    lo = add_layout("playlist_next")
-    lo.geometry = {x = lx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-    lo.style = osc_styles.icons_small
-    lx = lx + btn_w + btn_pad
-
-    -- Chapter next
-    if show_chapter then
-        lo = add_layout("chapter_next")
-        lo.geometry = {x = lx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-        lo.style = osc_styles.icons_small
-        lx = lx + btn_w + btn_pad
-    end
-
-    -- Right side: [fullscreen], [subtitle], [audio], [vol_slider], [volume], time_right
-    local rx = pill_right - pad  -- current x (right edge of next element)
-
-    -- Fullscreen
-    if show_fs then
-        rx = rx - btn_w
-        lo = add_layout("fullscreen")
-        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-        lo.style = osc_styles.icons_small
-        rx = rx - btn_pad
-    end
-
-    -- Subtitle button
-    if show_sub then
-        rx = rx - btn_w
-        lo = add_layout("sub_track")
-        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-        lo.style = osc_styles.icons_small
-        rx = rx - btn_pad
-    end
-
-    -- Audio button
-    if show_audio then
-        rx = rx - btn_w
-        lo = add_layout("audio_track")
-        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
-        lo.style = osc_styles.icons_small
-        rx = rx - btn_pad
-    end
-
-    -- Volume slider (inline mini slider)
     if show_vol_slider then
-        local vol_slider_w = 55
+        local vol_slider_w = 65
         local vol_slider_h = 14
-        rx = rx - vol_slider_w
         lo = add_layout("volume_slider")
-        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = vol_slider_w, h = vol_slider_h}
+        lo.geometry = {x = lx, y = ctrl_y, an = 4, w = vol_slider_w, h = vol_slider_h}
         lo.style = osc_styles.seekbar_fg
         lo.slider.border = 0
         lo.slider.gap = 1
         lo.slider.stype = "knob"
         lo.slider.tooltip_an = 2
         lo.slider.tooltip_style = osc_styles.tooltip
-        rx = rx - btn_pad
     end
 
-    -- Volume icon
-    if show_volume then
+    -- === CENTER GROUP: transport controls (centered on screen) ===
+    local center_btns = {}
+    table.insert(center_btns, {name = "playlist_prev", w = btn_w})
+    if show_chapter then
+        table.insert(center_btns, {name = "chapter_prev", w = btn_w})
+    end
+    table.insert(center_btns, {name = "play_pause", w = play_w})
+    if show_chapter then
+        table.insert(center_btns, {name = "chapter_next", w = btn_w})
+    end
+    table.insert(center_btns, {name = "playlist_next", w = btn_w})
+
+    local center_total_w = 0
+    for i, btn in ipairs(center_btns) do
+        center_total_w = center_total_w + btn.w
+        if i < #center_btns then
+            center_total_w = center_total_w + btn_gap
+        end
+    end
+
+    local cx = bar_cx - (center_total_w / 2)
+    for _, btn in ipairs(center_btns) do
+        lo = add_layout(btn.name)
+        if btn.name == "play_pause" then
+            lo.geometry = {x = cx, y = ctrl_y, an = 4, w = play_w, h = play_h}
+            lo.style = osc_styles.icons_large
+        else
+            lo.geometry = {x = cx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
+            lo.style = osc_styles.icons_small
+        end
+        cx = cx + btn.w + btn_gap
+    end
+
+    -- === RIGHT GROUP: audio, subtitle, fullscreen ===
+    local rx = bar_right - pad_h
+
+    if show_fs then
         rx = rx - btn_w
-        lo = add_layout("volume")
+        lo = add_layout("fullscreen")
         lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
         lo.style = osc_styles.icons_small
-        rx = rx - btn_pad
+        rx = rx - btn_gap
     end
 
-    -- Time right (remaining/total)
-    rx = rx - tc_w
-    lo = add_layout("tc_right")
-    lo.geometry = {x = rx, y = ctrl_y, an = 4, w = tc_w, h = btn_h}
-    lo.style = osc_styles.timecodes
+    if show_sub then
+        rx = rx - btn_w
+        lo = add_layout("sub_track")
+        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
+        lo.style = osc_styles.icons_small
+        rx = rx - btn_gap
+    end
+
+    if show_audio then
+        rx = rx - btn_w
+        lo = add_layout("audio_track")
+        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
+        lo.style = osc_styles.icons_small
+        rx = rx - btn_gap
+    end
+
+    if show_playlist then
+        rx = rx - btn_w
+        lo = add_layout("playlist_list")
+        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = btn_w, h = btn_h}
+        lo.style = osc_styles.icons_small
+        rx = rx - btn_gap
+    end
+
+    if show_speed then
+        local speed_w = 38
+        rx = rx - speed_w
+        lo = add_layout("speed")
+        lo.geometry = {x = rx, y = ctrl_y, an = 4, w = speed_w, h = btn_h}
+        lo.style = osc_styles.speed_text
+    end
 
     -- Window controls (top bar for borderless/fullscreen)
     if window_controls_enabled() then
@@ -1116,7 +1511,6 @@ local function layout_floating_pill()
             wc_x_start = osc_param.playresx - (wc_btn_w * 3) - 15
         end
 
-        -- Background bar for window controls
         new_element("wcbar", "box")
         lo = add_layout("wcbar")
         lo.geometry = {x = osc_param.playresx / 2, y = wc_y, an = 5,
@@ -1125,19 +1519,16 @@ local function layout_floating_pill()
         lo.style = osc_styles.wcBar
         lo.alpha[1] = math.min(255, user_opts.background_alpha + 30)
 
-        -- Close button
         lo = add_layout("wc_close")
         lo.geometry = {x = wc_x_start + (alignment == "left" and 0 or wc_btn_w * 2),
             y = wc_y, an = 4, w = wc_btn_w, h = wc_btn_w}
         lo.style = osc_styles.wcButtons
 
-        -- Minimize button
         lo = add_layout("wc_minimize")
         lo.geometry = {x = wc_x_start + (alignment == "left" and wc_btn_w or 0),
             y = wc_y, an = 4, w = wc_btn_w, h = wc_btn_w}
         lo.style = osc_styles.wcButtons
 
-        -- Maximize button
         lo = add_layout("wc_maximize")
         lo.geometry = {x = wc_x_start + wc_btn_w,
             y = wc_y, an = 4, w = wc_btn_w, h = wc_btn_w}
@@ -1265,14 +1656,78 @@ local function osc_init()
     -- === Audio Track ===
     ne = new_element("audio_track", "button")
     ne.enabled = audio_track_count > 0
-    ne.content = icons.audio
-    bind_mouse_buttons("audio_track")
+    -- Custom waveform-in-circle icon (ASS drawing, \p2 = 2x subpixel)
+    -- 40x40 canvas at \p2 = 20x20px icon; circle ring + 5 equalizer bars
+    ne.content = "{\\p2}"
+        -- outer circle CW (r=19, center 20,20)
+        .. "m 39 20 b 39 31 31 39 20 39 b 9 39 1 31 1 20 b 1 9 9 1 20 1 b 31 1 39 9 39 20 "
+        -- inner circle CCW (r=15, center 20,20) → ring hole
+        .. "m 35 20 b 35 12 28 5 20 5 b 12 5 5 12 5 20 b 5 28 12 35 20 35 b 28 35 35 28 35 20 "
+        -- 5 vertical bars (equalizer waveform)
+        .. "m 8 16 l 12 16 12 24 8 24 "
+        .. "m 13 13 l 17 13 17 27 13 27 "
+        .. "m 18 11 l 22 11 22 29 18 29 "
+        .. "m 23 13 l 27 13 27 27 23 27 "
+        .. "m 28 16 l 32 16 32 24 28 24"
+    ne.eventresponder["mbtn_left_up"] = function()
+        if state.dropdown == "audio" then
+            state.dropdown = nil
+        else
+            state.dropdown = "audio"
+            state.dropdown_scroll = 0
+        end
+        state.dropdown_items = {}
+        request_tick()
+    end
+    ne.eventresponder["wheel_up_press"] = function()
+        mp.command("cycle audio down")
+    end
+    ne.eventresponder["wheel_down_press"] = function()
+        mp.command("cycle audio")
+    end
 
     -- === Subtitle Track ===
     ne = new_element("sub_track", "button")
     ne.enabled = sub_track_count > 0
     ne.content = icons.subtitle
-    bind_mouse_buttons("sub_track")
+    ne.eventresponder["mbtn_left_up"] = function()
+        if state.dropdown == "sub" then
+            state.dropdown = nil
+        else
+            state.dropdown = "sub"
+            state.dropdown_scroll = 0
+        end
+        state.dropdown_items = {}
+        request_tick()
+    end
+    ne.eventresponder["wheel_up_press"] = function()
+        mp.command("cycle sub down")
+    end
+    ne.eventresponder["wheel_down_press"] = function()
+        mp.command("cycle sub")
+    end
+
+    -- === Playlist List ===
+    ne = new_element("playlist_list", "button")
+    ne.enabled = have_pl
+    ne.content = icons.playlist
+    ne.eventresponder["mbtn_left_up"] = function()
+        if state.dropdown == "playlist" then
+            state.dropdown = nil
+        else
+            state.dropdown = "playlist"
+            local pos = mp.get_property_number("playlist-pos", 0)
+            state.dropdown_scroll = math.max(0, pos - 2)
+        end
+        state.dropdown_items = {}
+        request_tick()
+    end
+    ne.eventresponder["wheel_up_press"] = function()
+        mp.command("playlist-prev")
+    end
+    ne.eventresponder["wheel_down_press"] = function()
+        mp.command("playlist-next")
+    end
 
     -- === Volume ===
     ne = new_element("volume", "button")
@@ -1323,6 +1778,43 @@ local function osc_init()
         ne.eventresponder["wheel_down_press"] = function()
             mp.commandv("osd-auto", "add", "volume", -5)
         end
+    end
+
+    -- === Speed ===
+    ne = new_element("speed", "button")
+    ne.content = function()
+        local speed = mp.get_property_number("speed", 1)
+        if speed == math.floor(speed) then
+            return string.format("%d.0x", speed)
+        else
+            return string.format("%gx", speed)
+        end
+    end
+    ne.eventresponder["mbtn_left_up"] = function()
+        if state.dropdown == "speed" then
+            state.dropdown = nil
+        else
+            state.dropdown = "speed"
+            state.dropdown_scroll = 0
+        end
+        state.dropdown_items = {}
+        request_tick()
+    end
+    ne.eventresponder["mbtn_right_up"] = function()
+        mp.set_property_number("speed", 1.0)
+        mp.osd_message("Speed: 1.0x")
+    end
+    ne.eventresponder["wheel_up_press"] = function()
+        local speed = mp.get_property_number("speed", 1)
+        speed = math.min(5.0, speed + 0.25)
+        mp.set_property_number("speed", speed)
+        mp.osd_message(string.format("Speed: %gx", speed))
+    end
+    ne.eventresponder["wheel_down_press"] = function()
+        local speed = mp.get_property_number("speed", 1)
+        speed = math.max(0.25, speed - 0.25)
+        mp.set_property_number("speed", speed)
+        mp.osd_message(string.format("Speed: %gx", speed))
     end
 
     -- === Fullscreen ===
@@ -1488,7 +1980,7 @@ local function osc_init()
     end
 
     -- === Apply Layout ===
-    layout_floating_pill()
+    layout_bottom_bar()
 
     -- === Finalize ===
     prepare_elements()
@@ -1527,6 +2019,10 @@ end
 
 local function hide_osc()
     msg.trace("hide_osc")
+    state.dropdown = nil
+    state.dropdown_items = {}
+    state.dropdown_hitbox = nil
+
     if not state.enabled then
         state.osc_visible = false
         render_wipe()
@@ -1541,6 +2037,8 @@ local function hide_osc()
 end
 
 local function mouse_leave()
+    -- Don't hide if a dropdown is open (mouse may have moved into dropdown area)
+    if state.dropdown ~= nil then return end
     if get_hidetimeout() >= 0 then
         hide_osc()
     end
@@ -1560,6 +2058,59 @@ local function process_event(source, what)
     local action = string.format("%s%s", source, what and ("_" .. what) or "")
 
     if what == "down" or what == "press" then
+
+        if source == "mbtn_left" then
+            state.click_consumed = false
+        end
+
+        -- Dropdown scroll interception (wheel events over dropdown)
+        if state.dropdown ~= nil and state.dropdown_hitbox and
+           (source == "wheel_up" or source == "wheel_down") then
+            local mx, my = get_virt_mouse_pos()
+            local dh = state.dropdown_hitbox
+            if mx >= dh.x1 and mx <= dh.x2 and my >= dh.y1 and my <= dh.y2 then
+                if source == "wheel_up" then
+                    state.dropdown_scroll = math.max(0, state.dropdown_scroll - 3)
+                else
+                    state.dropdown_scroll = state.dropdown_scroll + 3
+                end
+                request_tick()
+                return
+            end
+        end
+
+        -- Dropdown click interception (before element loop)
+        if state.dropdown ~= nil and source == "mbtn_left" then
+            local mx, my = get_virt_mouse_pos()
+            local hit_item = false
+            for _, item in ipairs(state.dropdown_items) do
+                if mx >= item.x1 and mx <= item.x2 and my >= item.y1 and my <= item.y2 then
+                    if state.dropdown == "playlist" then
+                        mp.set_property("playlist-pos", item.id)
+                    elseif state.dropdown == "speed" then
+                        if item.speed_val then
+                            mp.set_property_number("speed", item.speed_val)
+                        end
+                    else
+                        local prop = state.dropdown == "audio" and "aid" or "sid"
+                        if item.id == 0 then
+                            mp.set_property(prop, "no")
+                        else
+                            mp.set_property(prop, tostring(item.id))
+                        end
+                    end
+                    hit_item = true
+                    break
+                end
+            end
+            state.dropdown = nil
+            state.dropdown_items = {}
+            state.dropdown_hitbox = nil
+            state.click_consumed = true
+            request_tick()
+            return
+        end
+
         for n = 1, #elements do
             if mouse_hit(elements[n]) and elements[n].eventresponder and
                (elements[n].eventresponder[source .. "_up"] or
@@ -1575,7 +2126,33 @@ local function process_event(source, what)
             end
         end
 
+        -- Pill drag: if no element was hit, check if mouse is in pill area
+        if state.active_element == nil and source == "mbtn_left" then
+            local input_area = osc_param.areas["input"] and osc_param.areas["input"][1]
+            if input_area then
+                local mx, my = get_virt_mouse_pos()
+                if mx >= input_area.x1 and mx <= input_area.x2 and
+                   my >= input_area.y1 and my <= input_area.y2 then
+                    state.pill_dragging = true
+                    state.pill_drag_start_y = my
+                    state.pill_drag_start_offset = state.pill_y_offset or 0
+                end
+            end
+        end
+
     elseif what == "up" then
+
+        -- Pill drag end
+        if state.pill_dragging then
+            state.pill_dragging = false
+            state.pill_drag_start_y = nil
+            state.pill_drag_start_offset = nil
+            save_pill_offset()
+            request_tick()
+            return
+        end
+
+        local had_active = (state.active_element ~= nil)
         if elements[state.active_element] then
             local n = state.active_element
             if element_has_action(elements[n], action) and mouse_hit(elements[n]) then
@@ -1588,9 +2165,28 @@ local function process_event(source, what)
         state.active_element = nil
         state.mouse_down_counter = 0
 
+        -- Click on empty video area (not on any OSC element) toggles pause
+        if source == "mbtn_left" and not had_active and not state.click_consumed then
+            mp.commandv("cycle", "pause")
+        end
+
     elseif source == "mouse_move" then
         state.mouse_in_window = true
         local mouseX, mouseY = get_virt_mouse_pos()
+
+        -- Pill drag move
+        if state.pill_dragging then
+            local dy = state.pill_drag_start_y - mouseY
+            state.pill_y_offset = state.pill_drag_start_offset + dy
+            -- Clamp: can't go below default position, can't go off top
+            local max_offset = osc_param.playresy - user_opts.pill_bottom_margin
+                               - user_opts.bar_height - 20
+            state.pill_y_offset = math.max(0, math.min(max_offset, state.pill_y_offset))
+            request_init()
+            request_tick()
+            return
+        end
+
         if user_opts.minmousemove == 0 or
            ((state.last_mouseX ~= nil and state.last_mouseY ~= nil) and
             (math.abs(mouseX - state.last_mouseX) >= user_opts.minmousemove or
@@ -1691,7 +2287,12 @@ local function render()
 
     -- Mouse show/hide areas
     for _, cords in pairs(osc_param.areas["showhide"] or {}) do
-        set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, "showhide")
+        local y1 = cords.y1
+        -- Expand showhide area upward to cover dropdown when open
+        if state.dropdown ~= nil and state.dropdown_hitbox then
+            y1 = math.min(y1, state.dropdown_hitbox.y1)
+        end
+        set_virt_mouse_area(cords.x1, y1, cords.x2, cords.y2, "showhide")
     end
     if osc_param.areas["showhide_wc"] then
         for _, cords in pairs(osc_param.areas["showhide_wc"]) do
@@ -1706,7 +2307,12 @@ local function render()
     local mouse_over_osc = false
     for _, cords in ipairs(osc_param.areas["input"] or {}) do
         if state.osc_visible then
-            set_virt_mouse_area(cords.x1, cords.y1, cords.x2, cords.y2, "input")
+            local y1 = cords.y1
+            -- Expand input area upward to cover dropdown when open
+            if state.dropdown ~= nil and state.dropdown_hitbox then
+                y1 = math.min(y1, state.dropdown_hitbox.y1)
+            end
+            set_virt_mouse_area(cords.x1, y1, cords.x2, cords.y2, "input")
         end
         if state.osc_visible ~= state.input_enabled then
             if state.osc_visible then
@@ -1721,12 +2327,28 @@ local function render()
         end
     end
 
+    -- Also prevent hide when mouse is over an open dropdown
+    if state.dropdown ~= nil and state.dropdown_hitbox then
+        local dh = state.dropdown_hitbox
+        if mouse_hit_coords(dh.x1, dh.y1, dh.x2, dh.y2) then
+            mouse_over_osc = true
+        end
+    end
+
     -- Auto-hide timer
     if state.showtime ~= nil and get_hidetimeout() >= 0 then
         local timeout = state.showtime + (get_hidetimeout() / 1000) - now
         if timeout <= 0 then
             if state.active_element == nil and not mouse_over_osc then
                 hide_osc()
+            else
+                -- Mouse is over OSC/dropdown; re-check soon
+                if not state.hide_timer then
+                    state.hide_timer = mp.add_timeout(0, tick)
+                end
+                state.hide_timer.timeout = 0.5
+                state.hide_timer:kill()
+                state.hide_timer:resume()
             end
         else
             if not state.hide_timer then
@@ -1742,6 +2364,7 @@ local function render()
     local ass = assdraw.ass_new()
     if state.osc_visible then
         render_elements(ass)
+        render_dropdown(ass)
     end
 
     -- Submit
@@ -1904,8 +2527,48 @@ end)
 
 mp.register_event("start-file", request_init)
 
+-- Clamp window size to screen for large videos
+mp.register_event("file-loaded", function()
+    if state.fullscreen then return end
+    local vw = mp.get_property_number("video-params/dw")
+    local vh = mp.get_property_number("video-params/dh")
+    if not vw or not vh or vw <= 0 or vh <= 0 then return end
+
+    -- Get screen size
+    local sw = mp.get_property_number("display-width")
+    local sh = mp.get_property_number("display-height")
+    if not sw or not sh or sw <= 0 or sh <= 0 then
+        sw = 1920
+        sh = 1080
+    end
+
+    -- Allow up to 85% of screen dimensions
+    local max_w = math.floor(sw * 0.85)
+    local max_h = math.floor(sh * 0.85)
+
+    if vw > max_w or vh > max_h then
+        local scale = math.min(max_w / vw, max_h / vh)
+        mp.set_property_number("window-scale", scale)
+    end
+end)
+
+-- Briefly show OSC when a file starts playing
+mp.register_event("file-loaded", function()
+    if state.enabled and user_opts.visibility == "auto" then
+        show_osc()
+    end
+end)
+
 mp.observe_property("track-list", "native", request_init)
 mp.observe_property("playlist-count", "native", request_init)
+
+mp.observe_property("playlist-pos", "number", function()
+    if state.dropdown == "playlist" then
+        state.dropdown = nil
+        state.dropdown_items = {}
+    end
+    request_init()
+end)
 
 mp.observe_property("chapter-list", "native", function(_, list)
     list = list or {}
@@ -1992,6 +2655,15 @@ end)
 
 mp.add_key_binding(nil, "visibility", function() visibility_mode("cycle") end)
 
+-- Volume up/down arrows
+mp.add_key_binding("UP", "osc-volume-up", function()
+    mp.commandv("osd-auto", "add", "volume", "5")
+end, {repeatable = true})
+
+mp.add_key_binding("DOWN", "osc-volume-down", function()
+    mp.commandv("osd-auto", "add", "volume", "-5")
+end, {repeatable = true})
+
 ---------------------------------------------------------------------------
 -- Bootstrap
 ---------------------------------------------------------------------------
@@ -2017,7 +2689,7 @@ local function validate_user_opts()
 
     -- Validate ranges
     user_opts.panel_blur = math.min(40, math.max(0, user_opts.panel_blur or 2))
-    user_opts.background_alpha = math.min(255, math.max(0, user_opts.background_alpha or 40))
+    user_opts.background_alpha = math.min(255, math.max(0, user_opts.background_alpha or 30))
 
     if user_opts.seekrangestyle ~= "bar" and
        user_opts.seekrangestyle ~= "line" and
@@ -2059,6 +2731,7 @@ end)
 
 validate_user_opts()
 set_osc_styles()
+load_pill_offset()
 state.rightTC_trem = not user_opts.timetotal
 state.tc_ms = user_opts.timems
 set_tick_delay("display_fps", mp.get_property_number("display-fps"))
@@ -2066,4 +2739,4 @@ visibility_mode(user_opts.visibility, true)
 
 set_virt_mouse_area(0, 0, 0, 0, "input")
 
-msg.info("IINA-style floating pill OSC loaded")
+msg.info("IINA-style bottom bar OSC loaded")
