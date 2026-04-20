@@ -1,6 +1,7 @@
 # Add to ~/.config/mpv/mpv.conf
 
 osc=no
-
+osd-font="Songti SC"
+sub-font="Songti SC"
 # Optional: hide native window title bar for a cleaner macOS look
 # border=no
