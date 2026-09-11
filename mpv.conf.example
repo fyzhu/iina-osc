@@ -3,5 +3,6 @@
 osc=no
 osd-font="Songti SC"
 sub-font="Songti SC"
+osd-on-seek=msg #只显示时间文字，没有中间进度条
 # Optional: hide native window title bar for a cleaner macOS look
 # border=no
